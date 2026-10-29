@@ -1,0 +1,10 @@
+{
+  "name": "benny-scoreboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny Top 20 scoreboard server for Benny and the Jets",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED"
+}
