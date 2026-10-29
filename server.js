@@ -207,7 +207,12 @@ function limited(ip, kind, max, windowMs) {
   return arr.length > max;
 }
 setInterval(() => { const now = Date.now(); for (const [ip, h] of hits) if (!h.post.some((t) => now - t < 3600000) && !h.get.some((t) => now - t < 60000)) hits.delete(ip); }, 600000).unref();
+let ipDebug = 0;
 function clientIp(req) {
+  if (process.env.IP_DEBUG && ipDebug++ < 8) {
+    const xfn = String(req.headers["x-forwarded-for"] || "").split(",").length;
+    console.log("ipdebug headers=" + Object.keys(req.headers).join(",") + " xffEntries=" + xfn);
+  }
   const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
   return xf || req.socket.remoteAddress || "";
 }
