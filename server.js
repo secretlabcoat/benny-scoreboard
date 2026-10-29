@@ -207,14 +207,11 @@ function limited(ip, kind, max, windowMs) {
   return arr.length > max;
 }
 setInterval(() => { const now = Date.now(); for (const [ip, h] of hits) if (!h.post.some((t) => now - t < 3600000) && !h.get.some((t) => now - t < 60000)) hits.delete(ip); }, 600000).unref();
-let ipDebug = 0;
+// Render sits behind Cloudflare, which sets CF-Connecting-IP itself (a client-sent one is refused), so it can't be spoofed.
+// X-Forwarded-For's first entry CAN be faked by the caller, so it is only a last resort.
 function clientIp(req) {
-  if (process.env.IP_DEBUG && ipDebug++ < 8) {
-    const xfn = String(req.headers["x-forwarded-for"] || "").split(",").length;
-    console.log("ipdebug headers=" + Object.keys(req.headers).join(",") + " xffEntries=" + xfn);
-  }
-  const xf = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
-  return xf || req.socket.remoteAddress || "";
+  const one = (v) => String(v || "").split(",")[0].trim();
+  return one(req.headers["cf-connecting-ip"]) || one(req.headers["true-client-ip"]) || one(req.headers["x-forwarded-for"]) || req.socket.remoteAddress || "";
 }
 function fingerprint(ip) { return ip ? crypto.createHash("sha256").update(IP_SALT + "|" + ip).digest("hex").slice(0, 16) : ""; }
 function cors(req, res) {
