@@ -17,7 +17,7 @@ const V2_SLOTS = ["0e338981-5fab-4155-a8bf-b2021463ce2b", "e7f90a91-88a9-4205-b5
   "5a726bae-ae7e-4687-86bb-3cd267aa6ad1", "a9718c15-facc-413e-9253-0ac952ed02f7"].map((u) => TEXTDB + u);
 const V1_DOCS = [TEXTDB + "a83a65d3-c3a9-4e5f-8c71-636b8586721e", "https://textdb.online/benny-jets-8dede63c834ea2388388ce9c"];
 const LB_GAME = "benny-and-the-jets";
-const LB_SIZE = 20, KEEP = 100, NAME_MAX = 12, FP_MAX = 3, CITY_MAX = 24;
+const LB_SIZE = 20, KEEP = 100, NAME_MAX = 12, FP_MAX = 6, CITY_MAX = 24;
 const IP_SALT = "benny-jets-ipgate-v1-4a33d2f56891269ef972b04914124ce9";   // same hobby salt as the game, so k matches
 const ALLOWED_ORIGINS = ["https://4nqyxkp.sharehtml.org", "https://oddobiography.itch.io", "https://html.itch.zone", "https://html-classic.itch.zone"];
 
@@ -75,7 +75,7 @@ function validEntry(e) {
   const k = /^[0-9a-f]{16}$/.test(kRaw) ? kRaw : "";
   return { id, n, s, j, t, d, ...(b > 0 ? { b } : {}), ...(pen > 0 ? { p: pen } : {}), ...(c ? { c } : {}), ...(cc ? { cc } : {}), ...(k ? { k } : {}) };
 }
-// same ranking as the game: same id → stronger row; one best per name; ≤3 names per connection k
+// same ranking as the game: same id → stronger row; one best per name; ≤6 names per connection k (a family on one computer)
 function rankBoard(list, size) {
   const byId = new Map();
   for (const e of list) {
@@ -200,13 +200,14 @@ async function flush() {
 }
 
 // ---------- http ----------
-const hits = new Map();   // ip -> {post:[ts], get:[ts]}
+const hits = new Map();   // ip -> {post:[ts], postHr:[ts], get:[ts]}
+const POST_PER_MIN = 20, POST_PER_HOUR = 150;
 function limited(ip, kind, max, windowMs) {
-  const now = Date.now(); let h = hits.get(ip); if (!h) { h = { post: [], get: [] }; hits.set(ip, h); }
+  const now = Date.now(); let h = hits.get(ip); if (!h) { h = { post: [], postHr: [], get: [] }; hits.set(ip, h); }
   const arr = h[kind].filter((t) => now - t < windowMs); arr.push(now); h[kind] = arr;
   return arr.length > max;
 }
-setInterval(() => { const now = Date.now(); for (const [ip, h] of hits) if (!h.post.some((t) => now - t < 3600000) && !h.get.some((t) => now - t < 60000)) hits.delete(ip); }, 600000).unref();
+setInterval(() => { const now = Date.now(); for (const [ip, h] of hits) if (!h.postHr.some((t) => now - t < 3600000) && !h.get.some((t) => now - t < 60000)) hits.delete(ip); }, 600000).unref();
 // Render sits behind Cloudflare, which sets CF-Connecting-IP itself (a client-sent one is refused), so it can't be spoofed.
 // X-Forwarded-For's first entry CAN be faked by the caller, so it is only a last resort.
 function clientIp(req) {
@@ -259,7 +260,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, epoch, scores: top20() });
     }
     if (req.method === "POST" && path === "/scores") {
-      if (limited(ip, "post", 12, 60000)) return send(res, 429, { ok: false, error: "Too many saves – try again in a minute." });
+      // Loosened for shared computers / family wifi: 20 saves a minute, plus a 150-an-hour ceiling against floods.
+      if (limited(ip, "post", POST_PER_MIN, 60000) || limited(ip, "postHr", POST_PER_HOUR, 3600000)) { res.setHeader("Retry-After", "5"); return send(res, 429, { ok: false, error: "Too many saves – try again in a moment." }); }
       let raw;
       try { raw = JSON.parse(await readBody(req)); } catch { return send(res, 400, { ok: false, error: "bad json" }); }
       const src = raw && typeof raw === "object" && raw.entry && typeof raw.entry === "object" ? raw.entry : raw;
