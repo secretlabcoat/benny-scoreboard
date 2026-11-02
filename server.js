@@ -103,9 +103,28 @@ function rankBoard(list, size) {
   return out.slice(0, size);
 }
 
+// ---------- weekly board: same week as the game's layout seed (Sunday 00:00 America/Toronto) ----------
+// weekIdOf() is the game's weekIdToronto(): the day number (UTC days since 1970) of that week's Sunday.
+const TZ_FMT = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto", year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", weekday: "short", hourCycle: "h23" });
+const WD = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+function tzParts(ms) {
+  const o = {}; for (const p of TZ_FMT.formatToParts(new Date(ms))) o[p.type] = p.value;
+  return { y: +o.year, m: +o.month, d: +o.day, h: +o.hour % 24, mi: +o.minute, s: +o.second, wd: WD[o.weekday] ?? 0 };
+}
+function weekIdOf(ms) { const p = tzParts(ms); return Math.floor((Date.UTC(p.y, p.m - 1, p.d) - p.wd * 86400000) / 86400000); }
+// ms of Sunday 00:00 Toronto for a week id (DST switches at 2 AM, never at midnight, so 06:00 UTC that day has the right offset)
+function weekStartMs(id) {
+  const g = id * 86400000, probe = g + 6 * 3600000, p = tzParts(probe);
+  return g - (Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s) - probe);
+}
+const ARCHIVE_WEEKS = 104;   // past weeks kept (top 20 each, read-only via GET /scores?week=ID)
+
 // ---------- state ----------
 let board = [];          // ranked, up to KEEP
-let epoch = 1;           // last deliberate reset (ms); rows older are ignored when pulling docs
+let epoch = 1;           // max(this week's start, last deliberate reset) in ms; older rows are not on the board
+let week = weekIdOf(Date.now());   // current Toronto week id
+let archive = {};        // past weeks: { [weekId]: top-20 rows } (kept, never deleted by the rollover)
 let removed = [];        // admin-removed ids (tombstones so a pull can't bring them back)
 let loaded = false;      // true once the server backup doc has been read successfully
 let loadErr = "";
@@ -113,6 +132,25 @@ const bootAt = Date.now();
 const pendingAdds = [];  // entries accepted before the first successful load
 
 function top20() { return board.slice(0, LB_SIZE); }
+// Called before every read/write and once a minute: at Sunday 00:00 Toronto the board moves to the archive and starts empty.
+function rollover() {
+  const now = Date.now(); week = weekIdOf(now);
+  const start = weekStartMs(week);
+  let changed = false;
+  if (epoch < start) { epoch = start; changed = true; }
+  const old = board.filter((e) => (e.d || 0) < epoch);
+  if (old.length) {
+    const byWeek = {};
+    for (const e of old) (byWeek[weekIdOf(e.d || 0)] ||= []).push(e);
+    for (const [w, rows] of Object.entries(byWeek)) if (Number(w) < week) archive[w] = rankBoard([...(archive[w] || []), ...rows], LB_SIZE);
+    board = board.filter((e) => (e.d || 0) >= epoch);
+    changed = true;
+  }
+  const keys = Object.keys(archive).map(Number).sort((a, b) => b - a);
+  for (const k of keys.slice(ARCHIVE_WEEKS)) delete archive[k];
+  if (changed && loaded) scheduleSave();
+  return changed;
+}
 function absorb(rows) {
   const rm = new Set(removed);
   const ok = rows.filter((e) => e && !rm.has(e.id) && (e.d || 0) >= epoch);
@@ -134,7 +172,11 @@ function readDoc(txt) {
     const raw = JSON.parse(txt);
     const arr = Array.isArray(raw) ? raw : raw && Array.isArray(raw.scores) ? raw.scores : null;
     if (!arr) return null;
-    return { epoch: Math.floor(Number(raw.epoch)) || 0, removed: Array.isArray(raw.removed) ? raw.removed.map(String).slice(-300) : [],
+    const weeks = {};
+    if (raw && raw.weeks && typeof raw.weeks === "object") for (const [w, rows] of Object.entries(raw.weeks)) {
+      if (/^\d{4,6}$/.test(w) && Array.isArray(rows)) weeks[w] = rows.map(validEntry).filter(Boolean).slice(0, LB_SIZE);
+    }
+    return { weeks, epoch: Math.floor(Number(raw.epoch)) || 0, removed: Array.isArray(raw.removed) ? raw.removed.map(String).slice(-300) : [],
       scores: arr.map(validEntry).filter(Boolean) };
   } catch { return null; }
 }
@@ -149,8 +191,10 @@ async function pull(first) {
   const newEpoch = Math.max(epoch, ...healthy.map((d) => d.epoch));
   if (newEpoch > epoch) { epoch = newEpoch; board = board.filter((e) => (e.d || 0) >= epoch); }
   if (srv) removed = [...new Set([...removed, ...srv.removed])].slice(-300);
+  if (srv) for (const [w, rows] of Object.entries(srv.weeks)) archive[w] = rankBoard([...(archive[w] || []), ...rows], LB_SIZE);
   let changed = false;
   for (const d of [srv, ...v2, ...v1]) if (d) changed = absorb(d.scores) || changed;
+  if (first) rollover();   // a doc from last week (server slept over Sunday): its rows go to the archive, board starts empty
   return changed;
 }
 async function boot() {
@@ -185,7 +229,7 @@ async function flush() {
   if (saving) { scheduleSave(800); return; }
   saving = true; dirty = false;
   const now = Date.now();
-  const srvBody = JSON.stringify({ v: 1, game: LB_GAME + "-server", updated: now, epoch, removed, scores: board });
+  const srvBody = JSON.stringify({ v: 1, game: LB_GAME + "-server", updated: now, week, epoch, removed, scores: board, weeks: archive });
   const mainBody = JSON.stringify({ v: 1, game: LB_GAME, updated: now, epoch, scores: top20() });
   try {
     const res = await Promise.allSettled([
@@ -251,13 +295,20 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
     if (req.method === "GET" && (path === "/health" || path === "/")) {
-      return send(res, 200, { ok: true, loaded, rows: board.length, upSec: Math.round((Date.now() - bootAt) / 1000) });
+      rollover();
+      return send(res, 200, { ok: true, loaded, week, weekStart: weekStartMs(week), rows: board.length, upSec: Math.round((Date.now() - bootAt) / 1000) });
     }
     if (req.method === "GET" && path === "/scores") {
       if (limited(ip, "get", 120, 60000)) return send(res, 429, { ok: false, error: "slow down" });
       const ready = await whenLoaded(9000);
       if (!ready) return send(res, 503, { ok: false, error: "loading" });
-      return send(res, 200, { ok: true, epoch, scores: top20() });
+      rollover();
+      const wq = url.searchParams.get("week");
+      if (wq !== null && Number(wq) !== week) {   // a past week (read-only)
+        const w = Math.floor(Number(wq));
+        return send(res, 200, { ok: true, week: w, archived: true, scores: archive[w] || [] });
+      }
+      return send(res, 200, { ok: true, week, epoch, scores: top20() });
     }
     if (req.method === "POST" && path === "/scores") {
       // Loosened for shared computers / family wifi: 20 saves a minute, plus a 150-an-hour ceiling against floods.
@@ -266,6 +317,11 @@ const server = http.createServer(async (req, res) => {
       try { raw = JSON.parse(await readBody(req)); } catch { return send(res, 400, { ok: false, error: "bad json" }); }
       const src = raw && typeof raw === "object" && raw.entry && typeof raw.entry === "object" ? raw.entry : raw;
       const now = Date.now();
+      rollover();
+      // The game sends w = the week whose layout the run used. A phone still on last week's layout can't post into this week.
+      if (src && src.w !== undefined && src.w !== null && Math.floor(Number(src.w)) !== week) {
+        return send(res, 409, { ok: false, error: "week over", week });
+      }
       const k = fingerprint(ip);
       const e = validEntry({ ...src, d: now, ...(k ? { k } : {}) });
       if (!e) {
@@ -279,7 +335,7 @@ const server = http.createServer(async (req, res) => {
       else { pendingAdds.push(e); absorb([e]); }
       const t = top20();
       const rank = t.findIndex((x) => x.id === e.id);
-      return send(res, 200, { ok: true, epoch, accepted: true, onBoard: rank >= 0, rank: rank + 1, id: e.id, scores: t, persisted: ready });
+      return send(res, 200, { ok: true, week, epoch, accepted: true, onBoard: rank >= 0, rank: rank + 1, id: e.id, scores: t, persisted: ready });
     }
     if (req.method === "POST" && path === "/admin/reset") {
       if (!adminOk(req)) return send(res, 403, { ok: false });
@@ -287,6 +343,7 @@ const server = http.createServer(async (req, res) => {
       const ep = Math.floor(Number(body.epoch)) || Date.now();
       epoch = ep; board = []; removed = []; pendingAdds.length = 0;
       if (!loaded) { loaded = true; }
+      rollover();   // never below this week's start
       dirty = true; await flush();
       return send(res, 200, { ok: true, epoch, rows: board.length });
     }
@@ -312,6 +369,7 @@ server.keepAliveTimeout = 65000;
 server.listen(PORT, () => console.log(`benny-scoreboard on :${PORT}`));
 void boot();
 // While awake, absorb scores saved through the game's textdb fallback (every 3 min).
+setInterval(() => { if (loaded) rollover(); }, 60000).unref();   // Sunday 00:00 Toronto even with no traffic
 setInterval(() => { if (loaded) void pull(false).then((ch) => { if (ch) scheduleSave(); }).catch(() => {}); }, 180000).unref();
 async function shutdown() { try { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } dirty = dirty || false; await flush(); } finally { process.exit(0); } }
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);
